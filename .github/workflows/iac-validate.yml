@@ -72,7 +72,7 @@ jobs:
         # Security tab" rather than a red build -- the gate above is the real
         # signal either way.
         continue-on-error: true
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: cfn-lint.sarif
           category: cfn-lint
@@ -118,7 +118,7 @@ jobs:
       - name: Upload to Code Scanning
         if: always()
         continue-on-error: true
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: results.sarif
           category: checkov
