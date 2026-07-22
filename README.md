@@ -4,8 +4,7 @@ A deployable reference architecture for a HIPAA-aligned clinical data lake on AW
 
 Four CloudFormation layers, validated in CI by cfn-lint and Checkov, with the design decisions and their trade-offs recorded as ADRs.
 
-<!-- Replace OWNER/REPO once this is pushed, or delete the badge. -->
-<!-- [![IaC Validation](https://github.com/OWNER/REPO/actions/workflows/iac-validate.yml/badge.svg)](https://github.com/OWNER/REPO/actions/workflows/iac-validate.yml) -->
+[![IaC Validation](https://github.com/mmoideen/Blue-Anchor-hcls-clinical-data-platform/actions/workflows/iac-validate.yml/badge.svg)](https://github.com/mmoideen/Blue-Anchor-hcls-clinical-data-platform/actions/workflows/iac-validate.yml)
 
 ---
 
