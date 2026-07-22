@@ -1,0 +1,547 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >-
+  Layer 3 of 4 - Ingestion and de-identification. HealthLake FHIR R4 datastore,
+  a Glue pipeline that normalises raw clinical feeds into the conformed zone,
+  and a Safe Harbor de-identification job that is the sole path from PHI into
+  the de-identified zone. Orchestrated by Step Functions, triggered by
+  EventBridge on landing-zone arrivals.
+  Depends on the exports of 01-foundation-data-lake and 02-governance.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Stack wiring
+        Parameters:
+          - FoundationStackName
+          - GovernanceStackName
+      - Label:
+          default: Naming
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: Pipeline sizing
+        Parameters:
+          - GlueWorkerType
+          - GlueWorkerCount
+
+Parameters:
+  FoundationStackName:
+    Type: String
+    Default: hcls-lake-foundation
+
+  GovernanceStackName:
+    Type: String
+    Default: hcls-lake-governance
+
+  ProjectName:
+    Type: String
+    Default: hcls-lake
+    AllowedPattern: '^[a-z0-9][a-z0-9-]{1,10}[a-z0-9]$'
+    ConstraintDescription: Lowercase alphanumerics and hyphens, 3-12 characters.
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+  GlueWorkerType:
+    Type: String
+    Default: G.1X
+    AllowedValues: [G.1X, G.2X, G.4X, G.8X]
+    Description: >-
+      G.1X (4 vCPU / 16 GB) suits FHIR normalisation, which is IO-bound rather
+      than memory-bound. Move up only if executor OOMs appear in the logs.
+
+  GlueWorkerCount:
+    Type: Number
+    Default: 5
+    MinValue: 2
+    MaxValue: 100
+
+Resources:
+
+  # ===========================================================================
+  # HealthLake FHIR datastore
+  #
+  # A managed FHIR R4 server rather than a self-hosted HAPI FHIR cluster. The
+  # trade-off, and why it goes the other way for some customers, is recorded in
+  # docs/adr/0005-healthlake-over-self-managed-fhir.md
+  #
+  # Encrypted with the foundation PHI CMK: HealthLake holds identified clinical
+  # data and belongs on the same key as the zones it is built from.
+  # ===========================================================================
+
+  ClinicalFhirDatastore:
+    Type: AWS::HealthLake::FHIRDatastore
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      DatastoreName: !Sub '${ProjectName}-${Environment}-fhir'
+      DatastoreTypeVersion: R4
+      SseConfiguration:
+        KmsEncryptionConfig:
+          CmkType: CUSTOMER_MANAGED_KMS_KEY
+          KmsKeyId: !ImportValue
+            'Fn::Sub': '${FoundationStackName}-PhiEncryptionKeyArn'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: DataClassification
+          Value: PHI
+        - Key: Compliance
+          Value: HIPAA
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ===========================================================================
+  # Pipeline artefacts
+  #
+  # Glue scripts live outside the data zones. Code and clinical data have
+  # different access patterns, different reviewers, and different retention
+  # requirements; co-locating them means every grant on the script location is
+  # also a grant inside a PHI boundary.
+  # ===========================================================================
+
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-artifacts-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'aws:kms'
+              KMSMasterKeyID: !ImportValue
+                'Fn::Sub': '${FoundationStackName}-PhiEncryptionKeyArn'
+            BucketKeyEnabled: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !ImportValue
+          'Fn::Sub': '${FoundationStackName}-AccessLogBucketName'
+        LogFilePrefix: 'access-logs/artifacts/'
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireNoncurrentVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 90
+              NewerNoncurrentVersions: 5
+          - Id: AbortIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: DataClassification
+          Value: Internal
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  ArtifactsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt ArtifactsBucket.Arn
+              - !Sub '${ArtifactsBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  # ===========================================================================
+  # Glue
+  # ===========================================================================
+
+  # Glue writes job bookmarks, CloudWatch logs, and shuffle data outside the
+  # buckets configured in layer 1. Without a security configuration those
+  # side-channels are encrypted with service-owned keys, or not at all -- a
+  # gap that bucket-level encryption does not close, because it is not the
+  # bucket doing the writing.
+  GlueSecurityConfiguration:
+    Type: AWS::Glue::SecurityConfiguration
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-glue-sec'
+      EncryptionConfiguration:
+        S3Encryptions:
+          - S3EncryptionMode: SSE-KMS
+            KmsKeyArn: !ImportValue
+              'Fn::Sub': '${FoundationStackName}-PhiEncryptionKeyArn'
+        CloudWatchEncryption:
+          CloudWatchEncryptionMode: SSE-KMS
+          KmsKeyArn: !GetAtt GlueLogsEncryptionKey.Arn
+        JobBookmarksEncryption:
+          JobBookmarksEncryptionMode: CSE-KMS
+          KmsKeyArn: !ImportValue
+            'Fn::Sub': '${FoundationStackName}-PhiEncryptionKeyArn'
+
+  # CloudWatch Logs needs its own key: the logs service must be granted
+  # kms:Encrypt on whichever key it writes with, and adding that grant to the
+  # PHI key would widen a key whose whole purpose is to stay narrow.
+  GlueLogsEncryptionKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: !Sub '${ProjectName} ${Environment} - Glue CloudWatch logs'
+      EnableKeyRotation: true
+      PendingWindowInDays: 30
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableIAMUserPermissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AllowCloudWatchLogs
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - 'kms:Encrypt*'
+              - 'kms:Decrypt*'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:Describe*'
+            Resource: '*'
+            Condition:
+              ArnLike:
+                'kms:EncryptionContext:aws:logs:arn':
+                  !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Stage 1: raw clinical feeds (HL7v2, C-CDA, FHIR bundles) normalised to
+  # FHIR R4 and written as Parquet. Output stays PHI.
+  ConformJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-conform-to-fhir'
+      Description: Normalises raw clinical feeds to FHIR R4 Parquet
+      Role: !ImportValue
+        'Fn::Sub': '${GovernanceStackName}-DataEngineerRoleArn'
+      GlueVersion: '4.0'
+      WorkerType: !Ref GlueWorkerType
+      NumberOfWorkers: !Ref GlueWorkerCount
+      SecurityConfiguration: !Ref GlueSecurityConfiguration
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Sub 's3://${ArtifactsBucket}/glue/conform_to_fhir.py'
+      DefaultArguments:
+        '--job-language': python
+        '--job-bookmark-option': job-bookmark-enable
+        '--enable-metrics': 'true'
+        '--enable-continuous-cloudwatch-log': 'true'
+        '--enable-spark-ui': 'true'
+        '--TempDir': !Sub 's3://${ArtifactsBucket}/glue/tmp/'
+        '--source_bucket': !ImportValue
+          'Fn::Sub': '${FoundationStackName}-LandingZoneBucketName'
+        '--target_bucket': !ImportValue
+          'Fn::Sub': '${FoundationStackName}-ConformedZoneBucketName'
+      Tags:
+        Environment: !Ref Environment
+        DataClassification: PHI
+        ManagedBy: CloudFormation
+
+  # Stage 2: the PHI boundary crossing.
+  #
+  # Safe Harbor (45 CFR 164.514(b)(2)) removes the 18 enumerated identifiers.
+  # Free-text clinical notes are the hard part -- identifiers appear inline and
+  # unpredictably -- so Comprehend Medical DetectPHI handles those, while
+  # structured columns are transformed deterministically.
+  #
+  # Patient identifiers are replaced with randomly generated surrogates, not
+  # dropped and not hashed. Dropping them makes the output unlinkable, and a
+  # longitudinal readmission model must join encounters for the same patient.
+  #
+  # A keyed HMAC of the MRN is the tempting implementation and is the wrong
+  # one: 45 CFR 164.514(c) requires that a re-identification code be "not
+  # derived from or related to information about the individual", and an HMAC
+  # of the MRN is derived from it regardless of how hard it is to invert. A
+  # random surrogate plus a crosswalk held inside the PHI boundary is what the
+  # regulation actually contemplates. See docs/adr/0008.
+  DeIdentifyJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-deidentify'
+      Description: Safe Harbor de-identification; conformed zone to de-identified zone
+      Role: !ImportValue
+        'Fn::Sub': '${GovernanceStackName}-DeIdentificationPipelineRoleArn'
+      GlueVersion: '4.0'
+      WorkerType: !Ref GlueWorkerType
+      NumberOfWorkers: !Ref GlueWorkerCount
+      SecurityConfiguration: !Ref GlueSecurityConfiguration
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Sub 's3://${ArtifactsBucket}/glue/deidentify.py'
+      DefaultArguments:
+        '--job-language': python
+        '--job-bookmark-option': job-bookmark-enable
+        '--enable-metrics': 'true'
+        '--enable-continuous-cloudwatch-log': 'true'
+        '--TempDir': !Sub 's3://${ArtifactsBucket}/glue/tmp/'
+        '--source_bucket': !ImportValue
+          'Fn::Sub': '${FoundationStackName}-ConformedZoneBucketName'
+        '--target_bucket': !ImportValue
+          'Fn::Sub': '${FoundationStackName}-DeIdentifiedZoneBucketName'
+        '--deid_method': safe_harbor
+      Tags:
+        Environment: !Ref Environment
+        DataClassification: CrossBoundary
+        ManagedBy: CloudFormation
+
+  # ===========================================================================
+  # Orchestration
+  # ===========================================================================
+
+  PipelineLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub '/aws/vendedlogs/states/${ProjectName}-${Environment}-pipeline'
+      RetentionInDays: 365
+      KmsKeyId: !GetAtt GlueLogsEncryptionKey.Arn
+
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-pipeline-orchestrator'
+      Description: Step Functions orchestration. Starts Glue jobs; touches no data itself.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+      Policies:
+        - PolicyName: RunPipelineJobs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Scoped to the two jobs this pipeline owns. The orchestrator
+              # holds no S3 or KMS permissions at all: it starts jobs, and the
+              # jobs carry their own least-privilege roles.
+              - Sid: StartAndMonitorGlueJobs
+                Effect: Allow
+                Action:
+                  - 'glue:StartJobRun'
+                  - 'glue:GetJobRun'
+                  - 'glue:GetJobRuns'
+                  - 'glue:BatchStopJobRun'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:job/${ConformJob}'
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:job/${DeIdentifyJob}'
+              - Sid: WriteExecutionLogs
+                Effect: Allow
+                Action:
+                  - 'logs:CreateLogDelivery'
+                  - 'logs:GetLogDelivery'
+                  - 'logs:UpdateLogDelivery'
+                  - 'logs:DeleteLogDelivery'
+                  - 'logs:ListLogDeliveries'
+                  - 'logs:PutResourcePolicy'
+                  - 'logs:DescribeResourcePolicies'
+                  - 'logs:DescribeLogGroups'
+                # Step Functions vended logging requires account-level calls on
+                # these actions; they are not resource-scopable. Log content
+                # itself is confined to the log group above.
+                Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  ClinicalPipeline:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${ProjectName}-${Environment}-clinical-pipeline'
+      RoleArn: !GetAtt PipelineRole.Arn
+      StateMachineType: STANDARD
+      TracingConfiguration:
+        Enabled: true
+      LoggingConfiguration:
+        Level: ALL
+        IncludeExecutionData: false  # execution data can carry PHI in job arguments
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt PipelineLogGroup.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Landing -> conformed -> de-identified. Stages are strictly sequential: de-identification must never run against a partially written conformed dataset.",
+          "StartAt": "ConformToFhir",
+          "States": {
+            "ConformToFhir": {
+              "Type": "Task",
+              "Resource": "arn:${AWS::Partition}:states:::glue:startJobRun.sync",
+              "Parameters": {
+                "JobName": "${ConformJob}"
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": ["Glue.ConcurrentRunsExceededException"],
+                  "IntervalSeconds": 60,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "PipelineFailed",
+                  "ResultPath": "$.error"
+                }
+              ],
+              "Next": "DeIdentify"
+            },
+            "DeIdentify": {
+              "Type": "Task",
+              "Resource": "arn:${AWS::Partition}:states:::glue:startJobRun.sync",
+              "Parameters": {
+                "JobName": "${DeIdentifyJob}"
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": ["Glue.ConcurrentRunsExceededException"],
+                  "IntervalSeconds": 60,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "PipelineFailed",
+                  "ResultPath": "$.error"
+                }
+              ],
+              "Next": "PipelineSucceeded"
+            },
+            "PipelineSucceeded": {
+              "Type": "Succeed"
+            },
+            "PipelineFailed": {
+              "Type": "Fail",
+              "Error": "ClinicalPipelineFailed",
+              "Cause": "A pipeline stage failed. The de-identified zone may be stale; check the execution history before using it for training."
+            }
+          }
+        }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # EventBridge rather than S3 -> Lambda notifications: the landing zone
+  # already emits to EventBridge (layer 1), and routing through the bus means
+  # additional consumers can subscribe later without modifying the bucket.
+  PipelineTriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-pipeline-trigger'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+      Policies:
+        - PolicyName: StartPipeline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 'states:StartExecution'
+                Resource: !Ref ClinicalPipeline
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  LandingArrivalRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-landing-arrival'
+      Description: Starts the clinical pipeline when raw data lands
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - 'Object Created'
+        detail:
+          bucket:
+            name:
+              - !ImportValue
+                  'Fn::Sub': '${FoundationStackName}-LandingZoneBucketName'
+      Targets:
+        - Id: ClinicalPipeline
+          Arn: !Ref ClinicalPipeline
+          RoleArn: !GetAtt PipelineTriggerRole.Arn
+
+Outputs:
+  FhirDatastoreEndpoint:
+    Description: HealthLake FHIR R4 endpoint
+    Value: !GetAtt ClinicalFhirDatastore.DatastoreEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-FhirDatastoreEndpoint'
+
+  FhirDatastoreId:
+    Description: HealthLake datastore identifier
+    Value: !GetAtt ClinicalFhirDatastore.DatastoreId
+    Export:
+      Name: !Sub '${AWS::StackName}-FhirDatastoreId'
+
+  ArtifactsBucketName:
+    Description: Bucket holding Glue scripts and temporary pipeline data
+    Value: !Ref ArtifactsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ArtifactsBucketName'
+
+  ClinicalPipelineArn:
+    Description: Step Functions state machine orchestrating the pipeline
+    Value: !Ref ClinicalPipeline
+    Export:
+      Name: !Sub '${AWS::StackName}-ClinicalPipelineArn'
