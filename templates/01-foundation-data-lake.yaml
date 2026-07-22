@@ -1,0 +1,669 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >-
+  Layer 1 of 4 - Foundation. Zone-separated S3 data lake for clinical data,
+  with two customer-managed KMS keys splitting PHI from de-identified data,
+  enforced TLS, versioning, per-zone lifecycle policies, and centralised server
+  access logging. Deploy only under an active AWS Business Associate Addendum;
+  S3 and KMS are HIPAA-eligible services.
+  Deploy order: 01-foundation -> 02-governance -> 03-ingestion -> 04-ml-platform
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Naming
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: Retention
+        Parameters:
+          - ClinicalRecordRetentionDays
+          - NoncurrentVersionRetentionDays
+          - MinimumVersionsRetained
+          - AccessLogRetentionDays
+          - KmsKeyPendingWindowInDays
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: hcls-lake
+    # Capped at 12 characters. The longest composed bucket name is
+    # <project>-<env>-conformed-<12-digit account>-<region>, which reaches 59
+    # of the 63-character S3 limit when every component is at its maximum.
+    AllowedPattern: '^[a-z0-9][a-z0-9-]{1,10}[a-z0-9]$'
+    ConstraintDescription: Lowercase alphanumerics and hyphens, 3-12 characters.
+    Description: Lowercase name used as the bucket-name prefix.
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+  ClinicalRecordRetentionDays:
+    Type: Number
+    Default: 2555  # ~7 years
+    MinValue: 365
+    MaxValue: 9125
+    Description: >-
+      Retention for raw clinical records in the landing zone. Medical record
+      retention is set by state law, not by HIPAA, and commonly runs 6-10 years
+      from last encounter (longer for minors). Set to the longest period
+      applicable across your operating states.
+
+  NoncurrentVersionRetentionDays:
+    Type: Number
+    Default: 90
+    MinValue: 1
+    MaxValue: 3650
+
+  MinimumVersionsRetained:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 100
+    Description: >-
+      Noncurrent versions always kept regardless of age, so a rapid series of
+      overwrites cannot age every recoverable copy out at once.
+
+  AccessLogRetentionDays:
+    Type: Number
+    Default: 2555  # ~7 years
+    MinValue: 1
+    MaxValue: 3650
+    Description: >-
+      HIPAA does not fix an audit-log retention period. The 6-year
+      documentation requirement at 45 CFR 164.316(b)(2)(i) is the usual anchor;
+      this defaults slightly above it.
+
+  KmsKeyPendingWindowInDays:
+    Type: Number
+    Default: 30
+    MinValue: 7
+    MaxValue: 30
+
+Resources:
+
+  # ===========================================================================
+  # Encryption keys
+  #
+  # Two keys, split by data sensitivity rather than one per bucket or one per
+  # account. The de-identified zone is read by a materially wider audience
+  # (analysts, researchers, external collaborators) than the PHI zones, and a
+  # separate key lets that audience be granted and revoked without any grant
+  # ever touching PHI. See docs/adr/0004-two-cmks-split-by-sensitivity.md
+  #
+  # Both retained on delete and replace: the buckets are retained too, and
+  # destroying a key would leave every retained object permanently unreadable.
+  # ===========================================================================
+
+  PhiEncryptionKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: !Sub '${ProjectName} ${Environment} - PHI zones (landing, conformed, logs)'
+      EnableKeyRotation: true
+      PendingWindowInDays: !Ref KmsKeyPendingWindowInDays
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          # Delegates authorisation to IAM. AWS recommends retaining root
+          # access so the key cannot become unmanageable if the administrating
+          # principal is deleted. Workload roles get kms:Decrypt and
+          # kms:GenerateDataKey through their own IAM policies, not here.
+          - Sid: EnableIAMUserPermissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+
+          # S3 server access logging writes as this service principal and must
+          # be able to encrypt with the key. Source ARNs are composed from
+          # parameters rather than !Ref, which would create a circular
+          # dependency: bucket -> key -> bucket.
+          - Sid: AllowS3ServerAccessLogDelivery
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+              ArnLike:
+                'aws:SourceArn':
+                  - !Sub 'arn:${AWS::Partition}:s3:::${ProjectName}-${Environment}-landing-${AWS::AccountId}-${AWS::Region}'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${ProjectName}-${Environment}-conformed-${AWS::AccountId}-${AWS::Region}'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${ProjectName}-${Environment}-deid-${AWS::AccountId}-${AWS::Region}'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: DataClassification
+          Value: PHI
+        - Key: Compliance
+          Value: HIPAA
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  PhiEncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-${Environment}-phi'
+      TargetKeyId: !Ref PhiEncryptionKey
+
+  DeIdentifiedEncryptionKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: !Sub '${ProjectName} ${Environment} - de-identified analytics zone'
+      EnableKeyRotation: true
+      PendingWindowInDays: !Ref KmsKeyPendingWindowInDays
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableIAMUserPermissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: DataClassification
+          Value: DeIdentified
+        - Key: Compliance
+          Value: HIPAA
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  DeIdentifiedEncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-${Environment}-deid'
+      TargetKeyId: !Ref DeIdentifiedEncryptionKey
+
+  # ===========================================================================
+  # Access log bucket
+  #
+  # Separate from the data buckets: a bucket logging to itself generates writes
+  # that generate further log objects, recursively.
+  # ===========================================================================
+
+  AccessLogBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: >-
+              Access logging is intentionally not enabled on the log bucket
+              itself; log-delivery writes here would generate further
+              log-delivery objects, recursively. Integrity of this bucket is
+              covered by versioning, Retain policies, and the CloudTrail data
+              events configured in 02-governance.
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-logs-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          # KMSMasterKeyID, capital ID. CloudFormation rejects the template
+          # with "Encountered unsupported property" on any other casing.
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'aws:kms'
+              KMSMasterKeyID: !GetAtt PhiEncryptionKey.Arn
+            BucketKeyEnabled: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionLogsToGlacierIR
+            Status: Enabled
+            Transitions:
+              - StorageClass: GLACIER_IR
+                TransitionInDays: 90
+          - Id: ExpireAccessLogs
+            Status: Enabled
+            ExpirationInDays: !Ref AccessLogRetentionDays
+          - Id: AbortIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: DataClassification
+          Value: AuditLog
+        - Key: Compliance
+          Value: HIPAA
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  AccessLogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AccessLogBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Required because ACLs are disabled (BucketOwnerEnforced). Without
+          # this statement log delivery fails silently: no error, no logs.
+          - Sid: AllowS3ServerAccessLogDelivery
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: 's3:PutObject'
+            Resource: !Sub '${AccessLogBucket.Arn}/access-logs/*'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+              ArnLike:
+                'aws:SourceArn':
+                  - !Sub 'arn:${AWS::Partition}:s3:::${ProjectName}-${Environment}-landing-${AWS::AccountId}-${AWS::Region}'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${ProjectName}-${Environment}-conformed-${AWS::AccountId}-${AWS::Region}'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${ProjectName}-${Environment}-deid-${AWS::AccountId}-${AWS::Region}'
+
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt AccessLogBucket.Arn
+              - !Sub '${AccessLogBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  # ===========================================================================
+  # Zone 1 - Landing. Raw clinical data exactly as received: HL7v2 messages,
+  # C-CDA documents, FHIR bundles. Immutable, PHI, narrow access.
+  # ===========================================================================
+
+  LandingZoneBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    # S3 validates log-delivery permissions when logging is enabled, and
+    # CloudFormation infers no dependency on the policy resource. Without this,
+    # bucket creation can race the policy.
+    DependsOn: AccessLogBucketPolicy
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-landing-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'aws:kms'
+              KMSMasterKeyID: !GetAtt PhiEncryptionKey.Arn
+            BucketKeyEnabled: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogBucket
+        LogFilePrefix: 'access-logs/landing/'
+      LifecycleConfiguration:
+        Rules:
+          # Raw records are the system of record for reprocessing, and for any
+          # audit asking "what did the source system actually send us". Written
+          # once, read rarely: a fixed cold-tier transition beats
+          # Intelligent-Tiering when the access pattern is this predictable.
+          - Id: TransitionRawToGlacierIR
+            Status: Enabled
+            Transitions:
+              - StorageClass: GLACIER_IR
+                TransitionInDays: 90
+          - Id: ExpireAfterRetentionPeriod
+            Status: Enabled
+            ExpirationInDays: !Ref ClinicalRecordRetentionDays
+          - Id: ExpireNoncurrentVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: !Ref NoncurrentVersionRetentionDays
+              NewerNoncurrentVersions: !Ref MinimumVersionsRetained
+          - Id: AbortIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: DataClassification
+          Value: PHI
+        - Key: Zone
+          Value: Landing
+        - Key: Compliance
+          Value: HIPAA
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  LandingZoneBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LandingZoneBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt LandingZoneBucket.Arn
+              - !Sub '${LandingZoneBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+          # Bucket default encryption applies only when the client sends no
+          # encryption header. A client can still override it per-object with
+          # SSE-S3, bypassing the CMK and its audit trail. These two statements
+          # close that path.
+          #
+          # StringNotEqualsIfExists, not StringNotEquals: a plain
+          # StringNotEquals matches when the key is absent, which would deny
+          # every well-behaved client relying on bucket default encryption.
+          - Sid: DenyNonKmsEncryptionHeader
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:PutObject'
+            Resource: !Sub '${LandingZoneBucket.Arn}/*'
+            Condition:
+              StringNotEqualsIfExists:
+                's3:x-amz-server-side-encryption': 'aws:kms'
+
+          - Sid: DenyIncorrectKmsKey
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:PutObject'
+            Resource: !Sub '${LandingZoneBucket.Arn}/*'
+            Condition:
+              StringNotEqualsIfExists:
+                's3:x-amz-server-side-encryption-aws-kms-key-id': !GetAtt PhiEncryptionKey.Arn
+
+  # ===========================================================================
+  # Zone 2 - Conformed. Normalised to FHIR R4 and written as Parquet for
+  # analytics. Still PHI: normalisation changes shape, not sensitivity.
+  # ===========================================================================
+
+  ConformedZoneBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    DependsOn: AccessLogBucketPolicy
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-conformed-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'aws:kms'
+              KMSMasterKeyID: !GetAtt PhiEncryptionKey.Arn
+            BucketKeyEnabled: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogBucket
+        LogFilePrefix: 'access-logs/conformed/'
+      LifecycleConfiguration:
+        Rules:
+          # Intelligent-Tiering rather than a fixed transition: access here is
+          # driven by whichever cohort an analyst is working on this month,
+          # which is not predictable. No retrieval fee matters when the access
+          # pattern is bursty and unscheduled.
+          - Id: TransitionToIntelligentTiering
+            Status: Enabled
+            Transitions:
+              - StorageClass: INTELLIGENT_TIERING
+                TransitionInDays: 30
+          - Id: ExpireNoncurrentVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: !Ref NoncurrentVersionRetentionDays
+              NewerNoncurrentVersions: !Ref MinimumVersionsRetained
+          - Id: AbortIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: DataClassification
+          Value: PHI
+        - Key: Zone
+          Value: Conformed
+        - Key: Compliance
+          Value: HIPAA
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  ConformedZoneBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ConformedZoneBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt ConformedZoneBucket.Arn
+              - !Sub '${ConformedZoneBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+          - Sid: DenyNonKmsEncryptionHeader
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:PutObject'
+            Resource: !Sub '${ConformedZoneBucket.Arn}/*'
+            Condition:
+              StringNotEqualsIfExists:
+                's3:x-amz-server-side-encryption': 'aws:kms'
+
+          - Sid: DenyIncorrectKmsKey
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:PutObject'
+            Resource: !Sub '${ConformedZoneBucket.Arn}/*'
+            Condition:
+              StringNotEqualsIfExists:
+                's3:x-amz-server-side-encryption-aws-kms-key-id': !GetAtt PhiEncryptionKey.Arn
+
+  # ===========================================================================
+  # Zone 3 - De-identified. Output of the de-identification pipeline in
+  # 03-ingestion. Encrypted under a separate CMK so the wider analyst and
+  # research audience can be granted access without any grant on the PHI key.
+  # ===========================================================================
+
+  DeIdentifiedZoneBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    DependsOn: AccessLogBucketPolicy
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-deid-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'aws:kms'
+              KMSMasterKeyID: !GetAtt DeIdentifiedEncryptionKey.Arn
+            BucketKeyEnabled: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogBucket
+        LogFilePrefix: 'access-logs/deid/'
+      LifecycleConfiguration:
+        Rules:
+          # This zone holds the training corpora, read repeatedly and
+          # unpredictably during model development. It stays in
+          # Intelligent-Tiering rather than moving to a class that charges for
+          # retrieval.
+          - Id: TransitionToIntelligentTiering
+            Status: Enabled
+            Transitions:
+              - StorageClass: INTELLIGENT_TIERING
+                TransitionInDays: 30
+          - Id: ExpireNoncurrentVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: !Ref NoncurrentVersionRetentionDays
+              NewerNoncurrentVersions: !Ref MinimumVersionsRetained
+          - Id: AbortIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: DataClassification
+          Value: DeIdentified
+        - Key: Zone
+          Value: DeIdentified
+        - Key: Compliance
+          Value: HIPAA
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  DeIdentifiedZoneBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DeIdentifiedZoneBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt DeIdentifiedZoneBucket.Arn
+              - !Sub '${DeIdentifiedZoneBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+          - Sid: DenyNonKmsEncryptionHeader
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:PutObject'
+            Resource: !Sub '${DeIdentifiedZoneBucket.Arn}/*'
+            Condition:
+              StringNotEqualsIfExists:
+                's3:x-amz-server-side-encryption': 'aws:kms'
+
+          # Enforces the de-identified CMK specifically. A misconfigured job
+          # writing PHI-keyed objects into this zone would be a silent boundary
+          # violation; this turns it into an AccessDenied.
+          - Sid: DenyIncorrectKmsKey
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:PutObject'
+            Resource: !Sub '${DeIdentifiedZoneBucket.Arn}/*'
+            Condition:
+              StringNotEqualsIfExists:
+                's3:x-amz-server-side-encryption-aws-kms-key-id': !GetAtt DeIdentifiedEncryptionKey.Arn
+
+Outputs:
+  LandingZoneBucketName:
+    Description: Raw clinical data landing zone
+    Value: !Ref LandingZoneBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-LandingZoneBucketName'
+
+  LandingZoneBucketArn:
+    Description: Raw clinical data landing zone ARN
+    Value: !GetAtt LandingZoneBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LandingZoneBucketArn'
+
+  ConformedZoneBucketName:
+    Description: FHIR-normalised conformed zone
+    Value: !Ref ConformedZoneBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ConformedZoneBucketName'
+
+  ConformedZoneBucketArn:
+    Description: FHIR-normalised conformed zone ARN
+    Value: !GetAtt ConformedZoneBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ConformedZoneBucketArn'
+
+  DeIdentifiedZoneBucketName:
+    Description: De-identified analytics zone
+    Value: !Ref DeIdentifiedZoneBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-DeIdentifiedZoneBucketName'
+
+  DeIdentifiedZoneBucketArn:
+    Description: De-identified analytics zone ARN
+    Value: !GetAtt DeIdentifiedZoneBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DeIdentifiedZoneBucketArn'
+
+  AccessLogBucketName:
+    Description: Centralised S3 server access log bucket
+    Value: !Ref AccessLogBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-AccessLogBucketName'
+
+  PhiEncryptionKeyArn:
+    Description: CMK protecting the landing and conformed zones
+    Value: !GetAtt PhiEncryptionKey.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-PhiEncryptionKeyArn'
+
+  DeIdentifiedEncryptionKeyArn:
+    Description: CMK protecting the de-identified zone
+    Value: !GetAtt DeIdentifiedEncryptionKey.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DeIdentifiedEncryptionKeyArn'
