@@ -1,0 +1,11 @@
+# CI validation toolchain. Pinned for reproducible builds -- a green check on
+# an old commit should stay green. Dependabot (.github/dependabot.yml) opens a
+# PR when new versions ship, so pinning does not mean running stale
+# security rules; it means rule changes arrive as a reviewable diff rather
+# than as a surprise build failure on an unrelated PR.
+
+# The [sarif] extra pulls in sarif-om. Without it, `--format sarif` fails at
+# runtime with "Missing optional dependencies sarif".
+cfn-lint[sarif]==1.53.1
+
+checkov==3.3.8

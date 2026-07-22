@@ -1,0 +1,124 @@
+name: IaC Validation
+
+# Templates are validated on every change, and weekly against unchanged code:
+# cfn-lint and checkov ship new rules continuously, so a template that passed
+# at merge time can fail a policy published afterwards. The scheduled run
+# surfaces that as a build failure instead of an audit finding.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '17 6 * * 1'  # Mondays 06:17 UTC; off the hour to dodge scheduler contention
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # A glob, not a directory: cfn-lint rejects a bare directory path with
+  # "Template references a directory, not a file". The shell expands this
+  # before cfn-lint sees it.
+  TEMPLATES: templates/*.yaml
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Two parallel jobs rather than sequential steps: a template can be
+  # syntactically valid but policy-noncompliant, or vice versa. Running both
+  # independently surfaces every problem in a single CI round-trip instead of
+  # revealing the second class of failure only after the first is fixed.
+
+  cfn-lint:
+    name: Syntax and schema (cfn-lint)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-ci.txt
+
+      - name: Install toolchain
+        run: pip install -r requirements-ci.txt
+
+      # The gate. Validates against the CloudFormation resource schemas, so it
+      # catches the whole class of misspelled-property errors that otherwise
+      # only surface as a failed CreateStack -- KMSMasterKeyID vs
+      # KMSMasterKeyId being the one that bit this template.
+      - name: Lint templates
+        run: cfn-lint ${{ env.TEMPLATES }} --format pretty
+
+      # Separate invocation: cfn-lint emits one format per run, and the human
+      # -readable output above is what a reviewer actually reads in the log.
+      # always() so findings still reach Code Scanning when the gate fails --
+      # that is precisely when they are worth having.
+      - name: Generate SARIF
+        if: always()
+        run: cfn-lint ${{ env.TEMPLATES }} --format sarif --output-file cfn-lint.sarif || true
+
+      - name: Upload to Code Scanning
+        if: always()
+        # Code Scanning requires a public repo, or GitHub Advanced Security on
+        # a private one. Non-blocking so the absence of GHAS degrades to "no
+        # Security tab" rather than a red build -- the gate above is the real
+        # signal either way.
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: cfn-lint.sarif
+          category: cfn-lint
+
+  checkov:
+    name: Security policy (checkov)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-ci.txt
+
+      - name: Install toolchain
+        run: pip install -r requirements-ci.txt
+
+      # --skip-download suppresses the guideline fetch from the Prisma Cloud
+      # API. It only adds documentation URLs to findings; the checks run
+      # identically without it. Dropping the call removes a third-party network
+      # dependency from the critical path of every build.
+      #
+      # Suppressions are declared inline on the resource via Metadata.checkov,
+      # not with --skip-check here, so each one carries its justification next
+      # to the code it exempts and shows up in review.
+      - name: Scan templates
+        run: |
+          checkov \
+            --directory . \
+            --framework cloudformation \
+            --skip-download \
+            --quiet \
+            --compact \
+            --output cli \
+            --output sarif \
+            --output-file-path console,results.sarif
+
+      - name: Upload to Code Scanning
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: results.sarif
+          category: checkov

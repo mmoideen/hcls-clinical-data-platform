@@ -1,0 +1,25 @@
+version: 2
+updates:
+  # Keeps the pinned cfn-lint / checkov versions current. Without this, pinning
+  # in requirements-ci.txt would quietly freeze the security rule set.
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies
+      - ci
+    commit-message:
+      prefix: ci
+
+  # Action refs drift too, and a stale checkout/setup-python is its own
+  # supply-chain surface.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies
+      - ci
+    commit-message:
+      prefix: ci

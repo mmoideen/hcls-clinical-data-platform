@@ -1,0 +1,9 @@
+# Scan artifacts produced by the IaC Validation workflow. Generated per-run and
+# uploaded to Code Scanning; committing them would just create diff noise.
+*.sarif
+
+# Local validation venv
+venv/
+.venv/
+
+.DS_Store
