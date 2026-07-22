@@ -1,0 +1,600 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >-
+  Layer 2 of 4 - Governance. Glue Data Catalog databases per zone, Lake
+  Formation tag-based access control, CloudTrail S3 data-event auditing on the
+  PHI zones, and the three workload roles that define who may cross the
+  PHI/de-identified boundary.
+  Depends on the exports of 01-foundation-data-lake.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Stack wiring
+        Parameters:
+          - FoundationStackName
+      - Label:
+          default: Naming
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: Administration
+        Parameters:
+          - DataLakeAdminPrincipalArn
+          - CloudTrailRetentionDays
+
+Parameters:
+  FoundationStackName:
+    Type: String
+    Default: hcls-lake-foundation
+    Description: Stack name of 01-foundation-data-lake, read via Fn::ImportValue.
+
+  ProjectName:
+    Type: String
+    Default: hcls-lake
+    AllowedPattern: '^[a-z0-9][a-z0-9-]{1,10}[a-z0-9]$'
+    ConstraintDescription: Lowercase alphanumerics and hyphens, 3-12 characters.
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+  DataLakeAdminPrincipalArn:
+    Type: String
+    # Deliberately no default. Lake Formation admins can grant themselves
+    # access to every catalogued dataset including PHI, so the value must be a
+    # conscious choice at deploy time rather than something inherited from a
+    # template default nobody read.
+    AllowedPattern: '^arn:aws[a-z-]*:iam::[0-9]{12}:(role|user)/.+$'
+    ConstraintDescription: Must be an IAM role or user ARN.
+    Description: >-
+      IAM principal granted Lake Formation administrator rights. Use a role
+      assumed through IAM Identity Center, not a long-lived IAM user.
+
+  CloudTrailRetentionDays:
+    Type: Number
+    Default: 2555  # ~7 years
+    MinValue: 1
+    MaxValue: 3650
+    Description: Retention for CloudTrail logs, anchored to 45 CFR 164.316(b)(2)(i).
+
+Resources:
+
+  # ===========================================================================
+  # Audit trail
+  #
+  # CloudTrail management events record who changed the infrastructure. Data
+  # events record who read which object -- the latter is what HIPAA
+  # 164.312(b) actually asks for, and it is off by default.
+  #
+  # A dedicated CMK rather than the foundation PHI key: the trail must be
+  # readable by auditors who have no business decrypting clinical data, and
+  # a key policy is the cleanest place to draw that line.
+  # ===========================================================================
+
+  CloudTrailEncryptionKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: !Sub '${ProjectName} ${Environment} - CloudTrail audit logs'
+      EnableKeyRotation: true
+      PendingWindowInDays: 30
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableIAMUserPermissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+
+          - Sid: AllowCloudTrailEncrypt
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: 'kms:GenerateDataKey*'
+            Resource: '*'
+            Condition:
+              StringLike:
+                'kms:EncryptionContext:aws:cloudtrail:arn':
+                  !Sub 'arn:${AWS::Partition}:cloudtrail:*:${AWS::AccountId}:trail/*'
+
+          - Sid: AllowCloudTrailDescribeKey
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: 'kms:DescribeKey'
+            Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: DataClassification
+          Value: AuditLog
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  CloudTrailEncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-${Environment}-cloudtrail'
+      TargetKeyId: !Ref CloudTrailEncryptionKey
+
+  CloudTrailBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: >-
+              Server access logging is not enabled on the CloudTrail bucket.
+              CloudTrail log file validation (EnableLogFileValidation) provides
+              the tamper-evidence this control is reaching for, via SHA-256
+              digest files, and does so without the recursive-write problem.
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-trail-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'aws:kms'
+              KMSMasterKeyID: !GetAtt CloudTrailEncryptionKey.Arn
+            BucketKeyEnabled: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionTrailToGlacierIR
+            Status: Enabled
+            Transitions:
+              - StorageClass: GLACIER_IR
+                TransitionInDays: 90
+          - Id: ExpireTrailLogs
+            Status: Enabled
+            ExpirationInDays: !Ref CloudTrailRetentionDays
+          - Id: AbortIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: DataClassification
+          Value: AuditLog
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  CloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudTrailBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudTrailGetBucketAcl
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: 's3:GetBucketAcl'
+            Resource: !GetAtt CloudTrailBucket.Arn
+            Condition:
+              StringEquals:
+                'aws:SourceArn':
+                  !Sub 'arn:${AWS::Partition}:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${ProjectName}-${Environment}-trail'
+
+          - Sid: AllowCloudTrailPutObject
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: 's3:PutObject'
+            Resource: !Sub '${CloudTrailBucket.Arn}/AWSLogs/${AWS::AccountId}/*'
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': 'bucket-owner-full-control'
+                'aws:SourceArn':
+                  !Sub 'arn:${AWS::Partition}:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${ProjectName}-${Environment}-trail'
+
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt CloudTrailBucket.Arn
+              - !Sub '${CloudTrailBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  ClinicalDataTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: CloudTrailBucketPolicy
+    Properties:
+      TrailName: !Sub '${ProjectName}-${Environment}-trail'
+      S3BucketName: !Ref CloudTrailBucket
+      IsLogging: true
+      IsMultiRegionTrail: true
+      IncludeGlobalServiceEvents: true
+      # Produces hourly SHA-256 digest files, so a deleted or altered log file
+      # is detectable rather than merely unlikely. This is the control that
+      # makes the trail evidence rather than telemetry.
+      EnableLogFileValidation: true
+      KMSKeyId: !GetAtt CloudTrailEncryptionKey.Arn
+      AdvancedEventSelectors:
+        - Name: Management events
+          FieldSelectors:
+            - Field: eventCategory
+              Equals: [Management]
+
+        # Object-level reads and writes against the PHI zones. Scoped by ARN
+        # prefix rather than logging every bucket in the account: data events
+        # are billed per event, and an unscoped selector on a busy account is
+        # the usual reason teams turn data events off again.
+        - Name: S3 data events on PHI zones
+          FieldSelectors:
+            - Field: eventCategory
+              Equals: [Data]
+            - Field: resources.type
+              Equals: ['AWS::S3::Object']
+            - Field: resources.ARN
+              StartsWith:
+                - !Sub
+                  - 'arn:${AWS::Partition}:s3:::${BucketName}/'
+                  - BucketName: !Sub '${ProjectName}-${Environment}-landing-${AWS::AccountId}-${AWS::Region}'
+                - !Sub
+                  - 'arn:${AWS::Partition}:s3:::${BucketName}/'
+                  - BucketName: !Sub '${ProjectName}-${Environment}-conformed-${AWS::AccountId}-${AWS::Region}'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ===========================================================================
+  # Glue Data Catalog - one database per zone
+  #
+  # Zone separation is expressed in the catalog as well as in storage. A
+  # single database spanning all three zones would make Lake Formation grants
+  # depend entirely on table-level precision, which is exactly the kind of
+  # control that degrades as table counts grow.
+  # ===========================================================================
+
+  LandingDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub '${ProjectName}_${Environment}_landing'
+        Description: Raw clinical data as received from source systems (PHI)
+        LocationUri: !Sub
+          - 's3://${BucketName}/'
+          - BucketName: !ImportValue
+              'Fn::Sub': '${FoundationStackName}-LandingZoneBucketName'
+
+  ConformedDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub '${ProjectName}_${Environment}_conformed'
+        Description: FHIR R4 normalised clinical data in Parquet (PHI)
+        LocationUri: !Sub
+          - 's3://${BucketName}/'
+          - BucketName: !ImportValue
+              'Fn::Sub': '${FoundationStackName}-ConformedZoneBucketName'
+
+  DeIdentifiedDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub '${ProjectName}_${Environment}_deid'
+        Description: De-identified clinical data for analytics and ML training
+        LocationUri: !Sub
+          - 's3://${BucketName}/'
+          - BucketName: !ImportValue
+              'Fn::Sub': '${FoundationStackName}-DeIdentifiedZoneBucketName'
+
+  # ===========================================================================
+  # Lake Formation
+  #
+  # Tag-based access control rather than per-resource grants. With named-
+  # resource grants, every new table is a new grant on every role, and the
+  # permission set drifts from intent as the catalogue grows. With LF-Tags the
+  # grant is written once against a tag expression, and a newly registered
+  # table inherits the correct access the moment it is tagged.
+  # See docs/adr/0006-lake-formation-tag-based-access-control.md
+  # ===========================================================================
+
+  DataLakeSettings:
+    Type: AWS::LakeFormation::DataLakeSettings
+    Properties:
+      Admins:
+        - DataLakePrincipalIdentifier: !Ref DataLakeAdminPrincipalArn
+      # Empty defaults disable the IAMAllowedPrincipals backdoor, under which
+      # any principal with matching IAM permissions bypasses Lake Formation
+      # entirely. Leaving it on is the single most common reason a Lake
+      # Formation deployment provides no actual enforcement.
+      CreateDatabaseDefaultPermissions: []
+      CreateTableDefaultPermissions: []
+
+  DataClassificationTag:
+    Type: AWS::LakeFormation::Tag
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      TagKey: DataClassification
+      TagValues:
+        - PHI
+        - DeIdentified
+
+  ZoneTag:
+    Type: AWS::LakeFormation::Tag
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      TagKey: Zone
+      TagValues:
+        - Landing
+        - Conformed
+        - DeIdentified
+
+  # ===========================================================================
+  # Workload roles
+  #
+  # Three personas, deliberately unequal:
+  #   - Data engineers operate on PHI to build the conformed zone.
+  #   - Data scientists never touch PHI; they work only in the de-identified
+  #     zone. This is the control that lets model development proceed without
+  #     a per-project IRB review of individual access.
+  #   - The de-identification pipeline is the ONLY principal holding decrypt on
+  #     the PHI key and write on the de-identified zone simultaneously. Every
+  #     PHI-to-de-identified transition passes through it, which makes the
+  #     boundary auditable as a single chokepoint.
+  # ===========================================================================
+
+  DataEngineerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-data-engineer'
+      Description: Builds and operates the conformed zone. Handles PHI.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: 'sts:AssumeRole'
+            Condition:
+              Bool:
+                'aws:MultiFactorAuthPresent': 'true'
+      Policies:
+        - PolicyName: ZoneAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadLandingWriteConformed
+                Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                  - 's3:ListBucket'
+                Resource:
+                  - !ImportValue
+                      'Fn::Sub': '${FoundationStackName}-LandingZoneBucketArn'
+                  - !Sub
+                    - '${BucketArn}/*'
+                    - BucketArn: !ImportValue
+                        'Fn::Sub': '${FoundationStackName}-LandingZoneBucketArn'
+              - Sid: WriteConformedZone
+                Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 's3:DeleteObject'
+                  - 's3:ListBucket'
+                Resource:
+                  - !ImportValue
+                      'Fn::Sub': '${FoundationStackName}-ConformedZoneBucketArn'
+                  - !Sub
+                    - '${BucketArn}/*'
+                    - BucketArn: !ImportValue
+                        'Fn::Sub': '${FoundationStackName}-ConformedZoneBucketArn'
+              - Sid: UsePhiKey
+                Effect: Allow
+                Action:
+                  - 'kms:Decrypt'
+                  - 'kms:GenerateDataKey'
+                  - 'kms:DescribeKey'
+                Resource: !ImportValue
+                  'Fn::Sub': '${FoundationStackName}-PhiEncryptionKeyArn'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: DataAccess
+          Value: PHI
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  DataScientistRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-data-scientist'
+      Description: Model development. De-identified data only; no PHI access.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: 'sts:AssumeRole'
+            Condition:
+              Bool:
+                'aws:MultiFactorAuthPresent': 'true'
+      Policies:
+        - PolicyName: DeIdentifiedZoneAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadDeIdentifiedZone
+                Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                  - 's3:ListBucket'
+                Resource:
+                  - !ImportValue
+                      'Fn::Sub': '${FoundationStackName}-DeIdentifiedZoneBucketArn'
+                  - !Sub
+                    - '${BucketArn}/*'
+                    - BucketArn: !ImportValue
+                        'Fn::Sub': '${FoundationStackName}-DeIdentifiedZoneBucketArn'
+              - Sid: UseDeIdentifiedKey
+                Effect: Allow
+                Action:
+                  - 'kms:Decrypt'
+                  - 'kms:DescribeKey'
+                Resource: !ImportValue
+                  'Fn::Sub': '${FoundationStackName}-DeIdentifiedEncryptionKeyArn'
+              # No statement grants this role anything on the PHI key. Even if
+              # a bucket policy were misconfigured to permit the read, the
+              # objects would not decrypt.
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: DataAccess
+          Value: DeIdentifiedOnly
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  DeIdentificationPipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-deid-pipeline'
+      Description: >-
+        The only principal that crosses the PHI boundary. Reads conformed,
+        writes de-identified.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - glue.amazonaws.com
+                - states.amazonaws.com
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+      Policies:
+        - PolicyName: CrossBoundaryTransform
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadConformedZone
+                Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                  - 's3:ListBucket'
+                Resource:
+                  - !ImportValue
+                      'Fn::Sub': '${FoundationStackName}-ConformedZoneBucketArn'
+                  - !Sub
+                    - '${BucketArn}/*'
+                    - BucketArn: !ImportValue
+                        'Fn::Sub': '${FoundationStackName}-ConformedZoneBucketArn'
+              - Sid: WriteDeIdentifiedZone
+                Effect: Allow
+                Action:
+                  - 's3:PutObject'
+                  - 's3:ListBucket'
+                Resource:
+                  - !ImportValue
+                      'Fn::Sub': '${FoundationStackName}-DeIdentifiedZoneBucketArn'
+                  - !Sub
+                    - '${BucketArn}/*'
+                    - BucketArn: !ImportValue
+                        'Fn::Sub': '${FoundationStackName}-DeIdentifiedZoneBucketArn'
+              - Sid: DecryptPhiEncryptDeIdentified
+                Effect: Allow
+                Action:
+                  - 'kms:Decrypt'
+                  - 'kms:GenerateDataKey'
+                  - 'kms:DescribeKey'
+                Resource:
+                  - !ImportValue
+                      'Fn::Sub': '${FoundationStackName}-PhiEncryptionKeyArn'
+                  - !ImportValue
+                      'Fn::Sub': '${FoundationStackName}-DeIdentifiedEncryptionKeyArn'
+              - Sid: DetectPhiEntities
+                Effect: Allow
+                Action:
+                  - 'comprehendmedical:DetectPHI'
+                  - 'comprehendmedical:DetectEntitiesV2'
+                # Comprehend Medical exposes no resource-level permissions;
+                # these actions are only expressible against "*". The
+                # compensating control is that this role is assumable solely by
+                # the Glue and Step Functions service principals above, not by
+                # any human identity.
+                Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: DataAccess
+          Value: CrossBoundary
+        - Key: ManagedBy
+          Value: CloudFormation
+
+Outputs:
+  LandingDatabaseName:
+    Description: Glue catalog database for the landing zone
+    Value: !Ref LandingDatabase
+    Export:
+      Name: !Sub '${AWS::StackName}-LandingDatabaseName'
+
+  ConformedDatabaseName:
+    Description: Glue catalog database for the conformed zone
+    Value: !Ref ConformedDatabase
+    Export:
+      Name: !Sub '${AWS::StackName}-ConformedDatabaseName'
+
+  DeIdentifiedDatabaseName:
+    Description: Glue catalog database for the de-identified zone
+    Value: !Ref DeIdentifiedDatabase
+    Export:
+      Name: !Sub '${AWS::StackName}-DeIdentifiedDatabaseName'
+
+  DataEngineerRoleArn:
+    Description: Role for engineers building the conformed zone
+    Value: !GetAtt DataEngineerRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DataEngineerRoleArn'
+
+  DataScientistRoleArn:
+    Description: Role for model development, de-identified data only
+    Value: !GetAtt DataScientistRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DataScientistRoleArn'
+
+  DeIdentificationPipelineRoleArn:
+    Description: Role for the de-identification pipeline
+    Value: !GetAtt DeIdentificationPipelineRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DeIdentificationPipelineRoleArn'
+
+  CloudTrailArn:
+    Description: Trail capturing management and PHI-zone data events
+    Value: !GetAtt ClinicalDataTrail.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudTrailArn'
