@@ -8,4 +8,4 @@
 # runtime with "Missing optional dependencies sarif".
 cfn-lint[sarif]==1.53.1
 
-checkov==3.3.8
+checkov==3.3.9
