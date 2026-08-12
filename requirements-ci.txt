@@ -6,6 +6,6 @@
 
 # The [sarif] extra pulls in sarif-om. Without it, `--format sarif` fails at
 # runtime with "Missing optional dependencies sarif".
-cfn-lint[sarif]==1.53.1
+cfn-lint[sarif]==1.54.0
 
 checkov==3.3.8
